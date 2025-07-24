@@ -33,26 +33,54 @@
 
 namespace mooncake {
 
+/**
+ * @brief 根据全局配置获取传输工作线程数量
+ */
 const static int kTransferWorkerCount = globalConfig().workers_per_ctx;
 
+/**
+ * @brief 工作线程池构造函数
+ * @param context RDMA上下文引用
+ * @param numa_socket_id NUMA节点ID，用于CPU亲和性设置
+ *
+ * 初始化工作线程池：
+ * 1. 设置基本参数和计数器
+ * 2. 初始化切片队列
+ * 3. 创建工作线程
+ */
 WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
-    : context_(context),
-      numa_socket_id_(numa_socket_id),
-      workers_running_(true),
-      suspended_flag_(0),
-      redispatch_counter_(0),
-      submitted_slice_count_(0),
-      processed_slice_count_(0) {
+    : context_(context),              // RDMA上下文
+      numa_socket_id_(numa_socket_id),// NUMA节点ID
+      workers_running_(true),         // 工作线程运行标志
+      suspended_flag_(0),            // 暂停标志
+      redispatch_counter_(0),        // 重分发计数器
+      submitted_slice_count_(0),      // 已提交切片计数
+      processed_slice_count_(0) {     // 已处理切片计数
+
+    // 初始化每个分片的切片队列计数器
     for (int i = 0; i < kShardCount; ++i)
         slice_queue_count_[i].store(0, std::memory_order_relaxed);
+
+    // 分配集体切片队列空间
     collective_slice_queue_.resize(kTransferWorkerCount);
+
+    // 创建工作线程
     for (int i = 0; i < kTransferWorkerCount; ++i)
         worker_thread_.emplace_back(
             std::thread(std::bind(&WorkerPool::transferWorker, this, i)));
-    worker_thread_.emplace_back(
-        std::thread(std::bind(&WorkerPool::monitorWorker, this)));
+
+    // 创建并启动监控线程
+    monitor_thread_ = std::thread(std::bind(&WorkerPool::monitorWorker, this));
 }
 
+/**
+ * @brief 工作线程池析构函数
+ *
+ * 清理工作线程池资源：
+ * 1. 停止所有工作线程
+ * 2. 等待线程结束
+ * 3. 清理未处理的切片
+ */
 WorkerPool::~WorkerPool() {
     if (workers_running_) {
         cond_var_.notify_all();
@@ -61,6 +89,16 @@ WorkerPool::~WorkerPool() {
     }
 }
 
+/**
+ * @brief 提交切片到工作队列
+ * @param slice_list 切片列表
+ * @return 成功返回0，失败返回错误码
+ *
+ * 该方法将切片分配给工作线程：
+ * 1. 选择负载最小的工作队列
+ * 2. 将切片列表添加到队列
+ * 3. 通知工作线程处理
+ */
 int WorkerPool::submitPostSend(
     const std::vector<Transport::Slice *> &slice_list) {
 #ifdef CONFIG_CACHE_SEGMENT_DESC
@@ -159,6 +197,8 @@ int WorkerPool::submitPostSend(
     return 0;
 }
 
+
+
 void WorkerPool::performPostSend(int thread_id) {
     auto &local_slice_queue = collective_slice_queue_[thread_id];
     for (int shard_id = thread_id; shard_id < kShardCount;
@@ -256,6 +296,15 @@ void WorkerPool::performPostSend(int thread_id) {
     }
 }
 
+/**
+ * @brief 轮询完成队列
+ * @param thread_id 线程ID
+ *
+ * 处理RDMA完成事件：
+ * 1. 轮询完成队列获取事件
+ * 2. 更新切片状态
+ * 3. 处理完成和失败的情况
+ */
 void WorkerPool::performPollCq(int thread_id) {
     int processed_slice_count = 0;
     const static size_t kPollCount = 64;
@@ -314,6 +363,16 @@ void WorkerPool::performPollCq(int thread_id) {
         processed_slice_count_.fetch_add(processed_slice_count);
 }
 
+/**
+ * @brief 重新分发失败的切片
+ * @param slice_list 失败的切片列表
+ * @param thread_id 当前线程ID
+ *
+ * 处理传输失败的切片：
+ * 1. 检查重试次数
+ * 2. 重新提交或标记为失败
+ * 3. 在工作线程间重新分配
+ */
 void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                             int thread_id) {
     std::unordered_map<SegmentID, std::shared_ptr<Transport::SegmentDesc>>
@@ -353,6 +412,16 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
     }
 }
 
+/**
+ * @brief 工作线程主函数
+ * @param thread_id 线程ID
+ *
+ * 工作线程的主循环：
+ * 1. 等待新的切片任务
+ * 2. 处理切片传输请求monitorWorker
+ * 3. 轮询完成队列
+ * 4. 处理错误和重试
+ */
 void WorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
     const static uint64_t kWaitPeriodInNano = 100000000;  // 100ms
@@ -380,6 +449,15 @@ void WorkerPool::transferWorker(int thread_id) {
     }
 }
 
+/**
+ * @brief 处理RDMA上下文事件
+ * @return 成功返回0，失败返回错误码
+ *
+ * 处理RDMA设备的异步事件：
+ * 1. 端口状态变化
+ * 2. 路径迁移事件
+ * 3. QP状态变化
+ */
 int WorkerPool::doProcessContextEvents() {
     ibv_async_event event;
     if (ibv_get_async_event(context_.context(), &event) < 0) return ERR_CONTEXT;
@@ -397,10 +475,19 @@ int WorkerPool::doProcessContextEvents() {
         context_.set_active(true);
         LOG(INFO) << "Worker: Context " << context_.deviceName() << " is now active";
     }
+    // 确认事件处理完成
     ibv_ack_async_event(&event);
     return 0;
 }
 
+/**
+ * @brief 监控线程主函数
+ *
+ * 负责监控工作线程池的状态：
+ * 1. 监控RDMA设备状态
+ * 2. 收集性能统计信息
+ * 3. 处理异常情况
+ */
 void WorkerPool::monitorWorker() {
     bindToSocket(numa_socket_id_);
     while (workers_running_) {
