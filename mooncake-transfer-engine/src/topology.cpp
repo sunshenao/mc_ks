@@ -37,12 +37,31 @@
 #include "topology.h"
 
 namespace mooncake {
+/**
+ * @struct InfinibandDevice
+ * @brief InfiniBand网卡设备信息结构
+ *
+ * 记录了IB网卡的基本信息：
+ * - 设备名称（如mlx5_0）
+ * - PCI总线ID
+ * - NUMA节点编号
+ */
 struct InfinibandDevice {
-    std::string name;
-    std::string pci_bus_id;
-    int numa_node;
+    std::string name;         // 设备名称
+    std::string pci_bus_id;   // PCI总线ID
+//    这里的“PCI总线ID”指的是该InfiniBand网卡在主机PCI总线上的唯一标识符。它通常表示为域:总线:设备.功能（如0000:3b:00.0）
+    int numa_node;           // NUMA节点编号
 };
 
+/**
+ * @brief 列出系统中所有的InfiniBand设备
+ * @return InfiniBand设备列表
+ *
+ * 该函数通过扫描sysfs获取IB设备信息：
+ * 1. 遍历/sys/class/infiniband目录
+ * 2. 解析每个设备的PCI信息
+ * 3. 获取设备的NUMA节点信息
+ */
 static std::vector<InfinibandDevice> listInfiniBandDevices() {
     DIR *dir = opendir("/sys/class/infiniband");
     struct dirent *entry;
@@ -84,6 +103,17 @@ static std::vector<InfinibandDevice> listInfiniBandDevices() {
     return devices;
 }
 
+
+/**
+ * @brief 发现CPU的NUMA拓扑结构
+ * @param all_hca 所有IB设备的列表
+ * @return 拓扑条目列表
+ *
+ * 该函数分析系统的NUMA拓扑：
+ * 1. 遍历所有NUMA节点
+ * 2. 为每个节点构建本地和远程设备列表
+ * 3. 生成优先级矩阵
+ */
 static std::vector<TopologyEntry> discoverCpuTopology(
     const std::vector<InfinibandDevice> &all_hca) {
     DIR *dir = opendir("/sys/devices/system/node");
@@ -122,6 +152,16 @@ static std::vector<TopologyEntry> discoverCpuTopology(
 
 #ifdef USE_CUDA
 
+/**
+ * @brief 计算两个PCI设备之间的距离
+ * @param bus1 PCI设备1的总线ID
+ * @param bus2 PCI设备2的总线ID
+ * @return 距离值，表示两个设备之间的层级距离
+ *
+ * 该函数通过比较两个PCI设备的路径，计算它们之间的层级距离：
+ * - 路径越接近，距离值越小
+ * - 路径越远，距离值越大
+ */
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
     char path1[PATH_MAX];
@@ -151,7 +191,16 @@ static int getPciDistance(const char *bus1, const char *bus2) {
 
     return distance;
 }
-
+/**
+ * @brief 发现CUDA设备的拓扑结构
+ * @param all_hca 所有IB设备的列表
+ * @return CUDA拓扑条目列表
+ *
+ * 该函数分析系统中的CUDA设备及其拓扑：
+ * 1. 遍历所有CUDA设备
+ * 2. 根据PCI距离将设备分为优先和可用两类
+ * 3. 生成拓扑条目列表
+ */
 static std::vector<TopologyEntry> discoverCudaTopology(
     const std::vector<InfinibandDevice> &all_hca) {
     std::vector<TopologyEntry> topology;
@@ -200,6 +249,16 @@ void Topology::clear() {
     resolved_matrix_.clear();
 }
 
+/**
+ * @brief 发现系统的网络拓扑
+ * @return 成功返回0，失败返回错误码
+ *
+ * 该函数是拓扑发现的主入口：
+ * 1. 清空现有拓扑信息
+ * 2. 列出所有InfiniBand设备
+ * 3. 发现CPU和CUDA的拓扑结构
+ * 4. 解析并生成拓扑矩阵
+ */
 int Topology::discover() {
     matrix_.clear();
     auto all_hca = listInfiniBandDevices();
@@ -214,6 +273,15 @@ int Topology::discover() {
     return resolve();
 }
 
+/**
+ * @brief 解析给定的拓扑JSON字符串
+ * @param topology_json 拓扑信息的JSON字符串
+ * @return 成功返回0，失败返回错误码
+ *
+ * 该函数用于从外部加载拓扑信息：
+ * 1. 解析JSON格式的拓扑字符串
+ * 2. 将解析结果存入拓扑矩阵
+ */
 int Topology::parse(const std::string &topology_json) {
     std::set<std::string> rnic_set;
     Json::Value root;
@@ -263,6 +331,17 @@ Json::Value Topology::toJson() const {
     return root;
 }
 
+/**
+ * @brief 选择合适的设备进行存储操作
+ * @param storage_type 存储类型标识，例如cpu:1 cuda:0
+ * @param retry_count 重试次数
+ * @return 选择的设备ID，失败返回错误码
+ *
+ * 该函数根据拓扑信息和负载均衡策略，选择一个合适的设备：
+ * - 首先尝试从preferred_hca中选择
+ * - 如果失败，则从avail_hca中选择
+ * - 支持重试机制，以应对临时故障
+ */
 int Topology::selectDevice(const std::string storage_type, int retry_count) {
     if (!resolved_matrix_.count(storage_type)) return ERR_DEVICE_NOT_FOUND;
     auto &entry = resolved_matrix_[storage_type];
@@ -285,6 +364,14 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
     return 0;
 }
 
+/**
+ * @brief 解析并生成拓扑解析结果
+ * @return 成功返回0，失败返回错误码
+ *
+ * 该函数将原始拓扑矩阵解析为一个更简单的格式，便于后续处理：
+ * - 为每个设备分配唯一的ID
+ * - 生成resolved_matrix用于快速查找
+ */
 int Topology::resolve() {
     std::map<std::string, int> hca_id_map;
     int next_hca_map_index = 0;

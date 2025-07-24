@@ -117,7 +117,7 @@ class RdmaEndPoint {
     std::atomic<Status> status_;
 
     RWSpinlock lock_;
-    std::vector<ibv_qp *> qp_list_;
+    std::vector<ibv_qp *> qp_list_;// 存储多个队列对
 
     std::string peer_nic_path_;
 

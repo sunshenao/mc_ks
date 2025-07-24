@@ -29,6 +29,8 @@ VLLMAdaptor::~VLLMAdaptor() {
 }
 
 std::string formatDeviceNames(const std::string &device_names) {
+//     tokens 向量将包含：["device1", "device2", "device3"]
+// formatted 字符串将变为："\"device1\",\"device2\",\"device3\""
     std::stringstream ss(device_names);
     std::string item;
     std::vector<std::string> tokens;
@@ -72,7 +74,11 @@ int VLLMAdaptor::initialize(const char *local_hostname,
     return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
                          device_name, conn_string.first.c_str());
 }
-
+// local_hostname 相当于prefill_url 包含端口
+// metadata_server 相当于kv键值数据库的地址 包含端口
+// protocol 相当于传输协议
+// device_name 相当于设备名称 【例如：rdma设备名称,mlx1】
+// metadata_type 相当于元数据类型 【例如：etcd】
 int VLLMAdaptor::initializeExt(const char *local_hostname,
                                const char *metadata_server,
                                const char *protocol, const char *device_name,
@@ -122,6 +128,9 @@ char *VLLMAdaptor::allocateRawBuffer(size_t capacity) {
     return (char *)buffer;
 }
 
+// 🔍 根据输入的 size（单位：字节），找到对应的“类 ID”（class ID），
+// 这个 class ID 通常用于 内存分配器 中的 分配粒度分类
+// （比如 slab allocator、buddy allocator 等）
 int VLLMAdaptor::findClassId(size_t size) {
     if (size > 1024ull * kSlabSizeKB[kMaxClassId]) return -1;
     for (int i = kMaxClassId - 2; i >= 0; --i)
@@ -129,6 +138,8 @@ int VLLMAdaptor::findClassId(size_t size) {
     return 0;
 }
 
+// 这段代码是一个经典的 Buddy 内存分配算法（Buddy Allocator） 的实现部分，
+// 具体是用于在指定 class_id 的内存块不足时，从更大的内存块中“拆分”出两个更小的块。
 int VLLMAdaptor::doBuddyAllocate(int class_id) {
     if (class_id == kMaxClassId) {
         auto buffer = allocateRawBuffer(kDefaultBufferCapacity);
@@ -155,10 +166,10 @@ uintptr_t VLLMAdaptor::allocateManagedBuffer(size_t length) {
     int class_id = findClassId(length);
     if (class_id < 0) {
         char *buffer = allocateRawBuffer(length);
-        if (buffer) large_buffer_list_.insert(buffer);
+        if (buffer) large_buffer_list_.insert(buffer); // 分配一个大内存块
         return (uintptr_t)buffer;
     }
-    if (free_list_[class_id].empty())
+    if (free_list_[class_id].empty()) //该大小的内存块不存在，就将更大的进行分块
         if (doBuddyAllocate(class_id)) return 0;
     assert(!free_list_[class_id].empty());
     char *buffer = free_list_[class_id].top();
@@ -180,12 +191,17 @@ int VLLMAdaptor::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
     return 0;
 }
 
+// 将本地地址 buffer 处的数据，通过网络或某种传输机制，
+//同步地传输到远端主机 target_hostname 的 peer_buffer_address 处，
+// 长度为 length 字节。
+
+
 int VLLMAdaptor::transferSync(const char *target_hostname, uintptr_t buffer,
                               uintptr_t peer_buffer_address, size_t length) {
     Transport::SegmentHandle handle;
     if (handle_map_.count(target_hostname)) {
         handle = handle_map_[target_hostname];
-    } else {
+    } else { // target_hostname这里对应的就是segment_name名
         handle = engine_->openSegment(target_hostname);
         if (handle == (Transport::SegmentHandle)-1) return -1;
         handle_map_[target_hostname] = handle;
@@ -216,6 +232,7 @@ int VLLMAdaptor::transferSync(const char *target_hostname, uintptr_t buffer,
     }
 }
 
+// 用于在本地注册和注销内存区域，供后续的远程数据传输使用。
 int VLLMAdaptor::expRegisterMemory(uintptr_t buffer_addr, size_t capacity) {
     char *buffer = reinterpret_cast<char *>(buffer_addr);
     return engine_->registerLocalMemory(buffer, capacity, "cpu:0");

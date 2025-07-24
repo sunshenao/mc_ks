@@ -31,6 +31,15 @@
 #include "transport/transport.h"
 
 namespace mooncake {
+
+/**
+ * @brief 检查GID是否为空
+ * @param gid 待检查的GID指针
+ * @return 如果GID全为0返回1，否则返回0
+ *
+ * GID(Global Identifier)是RDMA网络中的全局标识符，
+ * 用于RoCE网络中的路由和寻址。
+ */
 static int isNullGid(union ibv_gid *gid) {
     for (int i = 0; i < 16; ++i) {
         if (gid->raw[i] != 0) return 0;
@@ -38,14 +47,25 @@ static int isNullGid(union ibv_gid *gid) {
     return 1;
 }
 
+/**
+ * @brief RDMA上下文构造函数
+ * @param engine RDMA传输引擎引用
+ * @param device_name 设备名称（如"mlx5_0"）
+ *
+ * 初始化RDMA上下文：
+ * 1. 设置设备参数
+ * 2. 初始化计数器
+ * 3. 确保fork安全性
+ */
 RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
-    : device_name_(device_name),
-      engine_(engine),
-      next_comp_channel_index_(0),
-      next_comp_vector_index_(0),
-      next_cq_list_index_(0),
-      worker_pool_(nullptr),
-      active_(true) {
+    : device_name_(device_name),            // RDMA设备名称
+      engine_(engine),                      // 传输引擎引用
+      next_comp_channel_index_(0),          // 完成通道索引
+      next_comp_vector_index_(0),           // 完成向量索引
+      next_cq_list_index_(0),               // 完成队列索引
+      worker_pool_(nullptr),                // 工作线程池指针
+      active_(true) {                       // 设备活跃状态
+    // 确保fork安全性的一次性初始化
     static std::once_flag g_once_flag;
     auto fork_init = []() {
         int ret = ibv_fork_init();
@@ -58,9 +78,28 @@ RdmaContext::~RdmaContext() {
     if (context_) deconstruct();
 }
 
+/**
+ * @brief 构建RDMA上下文
+ * @param num_cq_list 完成队列数量
+ * @param num_comp_channels 完成通道数量
+ * @param port RDMA端口号
+ * @param gid_index GID索引
+ * @param max_cqe 每个完成队列的最大条目数
+ * @param max_endpoints 最大端点数
+ * @return 成功返回0，失败返回错误码
+ *
+ * 该函数完成RDMA上下文的完整初始化：
+ * 1. 创建端点存储管理器
+ * 2. 打开并配置RDMA设备
+ * 3. 分配保护域(PD)
+ * 4. 创建完成通道和事件系统
+ * 5. 创建完成队列(CQ)
+ * 6. 启动工作线程池
+ */
 int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
                            uint8_t port, int gid_index, size_t max_cqe,
                            int max_endpoints) {
+    // 创建端点存储管理器（使用SIEVE缓存策略）
     endpoint_store_ = std::make_shared<SIEVEEndpointStore>(max_endpoints);
     if (openRdmaDevice(device_name_, port, gid_index)) {
         LOG(ERROR) << "Failed to open device " << device_name_ << " on port "
